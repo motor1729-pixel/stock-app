@@ -14,7 +14,7 @@ class BacktestConfig:
 
 
 def run_backtest(prices: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
-    """Run a long-only moving-average backtest without look-ahead bias."""
+    """Backtest a one-share, long-only moving-average strategy."""
     if config.short_window < 2:
         raise ValueError("단기 이동평균은 2일 이상이어야 합니다.")
     if config.short_window >= config.long_window:
@@ -37,19 +37,32 @@ def run_backtest(prices: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
     result["LongMA"] = result["Close"].rolling(config.long_window).mean()
     result["Signal"] = (result["ShortMA"] > result["LongMA"]).astype(int)
 
-    # A signal calculated at today's close becomes a position on the next day.
+    # A signal calculated at today's close applies to the next close-to-close interval.
     result["Position"] = result["Signal"].shift(1).fillna(0).astype(int)
-    result["MarketReturn"] = result["Close"].pct_change().fillna(0.0)
     result["Turnover"] = result["Position"].diff().abs().fillna(
         result["Position"].abs()
     )
+    result["MarketReturn"] = result["Close"].pct_change().fillna(0.0)
+
     cost_rate = config.trading_cost_pct / 100.0
-    gross_return = result["MarketReturn"] * result["Position"]
-    result["StrategyReturn"] = (1.0 + gross_return) * (
-        1.0 - result["Turnover"] * cost_rate
-    ) - 1.0
-    result["StrategyEquity"] = (1.0 + result["StrategyReturn"]).cumprod()
-    result["BuyHoldEquity"] = (1.0 + result["MarketReturn"]).cumprod()
+    execution_price = result["Close"].shift(1).fillna(result["Close"])
+    result["OneShareCost"] = execution_price * result["Turnover"] * cost_rate
+    result["OneShareDailyPnl"] = (
+        result["Close"].diff().fillna(0.0) * result["Position"]
+        - result["OneShareCost"]
+    )
+    result["OneShareProfit"] = result["OneShareDailyPnl"].cumsum()
+
+    initial_price = float(result["Close"].iloc[0])
+    result["OneShareValue"] = initial_price + result["OneShareProfit"]
+    result["BuyHoldOneShareProfit"] = result["Close"] - initial_price
+    result["BuyHoldOneShareValue"] = result["Close"]
+
+    result["StrategyReturn"] = (
+        result["OneShareValue"].pct_change().fillna(0.0)
+    )
+    result["StrategyEquity"] = result["OneShareValue"] / initial_price
+    result["BuyHoldEquity"] = result["BuyHoldOneShareValue"] / initial_price
     result["Entry"] = result["Signal"].diff().eq(1)
     result["Exit"] = result["Signal"].diff().eq(-1)
     return result
@@ -59,21 +72,29 @@ def performance_metrics(result: pd.DataFrame) -> dict[str, float | int]:
     if result.empty:
         raise ValueError("성과를 계산할 데이터가 없습니다.")
 
-    equity = result["StrategyEquity"]
-    running_high = equity.cummax()
-    drawdown = equity / running_high - 1.0
+    value = result["OneShareValue"]
+    running_high = value.cummax()
+    drawdown = value / running_high - 1.0
     elapsed_days = max((result.index[-1] - result.index[0]).days, 1)
     years = elapsed_days / 365.25
-    cagr = equity.iloc[-1] ** (1.0 / years) - 1.0
+    total_return = value.iloc[-1] / value.iloc[0] - 1.0
+    cagr = (
+        value.iloc[-1] / value.iloc[0]
+    ) ** (1.0 / years) - 1.0 if value.iloc[-1] > 0 else -1.0
     volatility = result["StrategyReturn"].std(ddof=0) * np.sqrt(252)
-    invested = result.loc[result["Position"].eq(1), "StrategyReturn"]
+    invested = result.loc[result["Position"].eq(1), "OneShareDailyPnl"]
 
     return {
-        "total_return": float(equity.iloc[-1] - 1.0),
+        "initial_capital": float(value.iloc[0]),
+        "one_share_profit": float(result["OneShareProfit"].iloc[-1]),
+        "buy_hold_one_share_profit": float(result["BuyHoldOneShareProfit"].iloc[-1]),
+        "current_value": float(value.iloc[-1]),
+        "total_return": float(total_return),
         "buy_hold_return": float(result["BuyHoldEquity"].iloc[-1] - 1.0),
         "cagr": float(cagr),
         "max_drawdown": float(drawdown.min()),
         "annual_volatility": float(volatility),
         "trade_count": int(result["Entry"].sum()),
         "positive_day_ratio": float((invested > 0).mean()) if not invested.empty else 0.0,
+        "current_position": int(result["Position"].iloc[-1]),
     }
